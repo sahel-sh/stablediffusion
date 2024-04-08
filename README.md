@@ -7,7 +7,7 @@ This repository contains [Stable Diffusion](https://github.com/CompVis/stable-di
 new checkpoints. The following list provides an overview of all currently available models. More coming soon.
 
 ## News
-
+**ADD SigLIP**
 
 **March 24, 2023**
 
