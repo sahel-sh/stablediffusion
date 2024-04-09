@@ -3,7 +3,16 @@ import torch.nn as nn
 import kornia
 from torch.utils.checkpoint import checkpoint
 
-from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextModel
+from transformers import (
+    T5Tokenizer, 
+    T5EncoderModel,
+    CLIPTokenizer,
+    CLIPTextModel,
+    AutoTokenizer,
+    Blip2Model,
+    AutoProcessor,
+    AutoModel,
+)
 
 import open_clip
 from ldm.util import default, count_params, autocast
@@ -172,6 +181,82 @@ class ClipImageEmbedder(nn.Module):
             out = torch.bernoulli((1. - self.ucg_rate) * torch.ones(out.shape[0], device=out.device))[:, None] * out
         return out
 
+class FrozenSiglipEmbedder(AbstractEncoder):
+    """
+    Uses the Siglip transformer encoder for text
+    """
+    LAYERS = [
+        "last",
+        "hidden"
+    ]
+    def __init__(self, version="google/siglip-large-patch16-256", device="cuda", max_length=77, freeze=True, layer="last", layer_idx=None):
+        super().__init__()
+        assert layer in self.LAYERS, f"unsupported layer {layer}. Must be one of {self.LAYERS}"
+        self.device = device
+        self.max_length = max_length
+        self.model = AutoModel.from_pretrained(version).to(device)
+        self.processor = AutoProcessor.from_pretrained(version)
+
+        if freeze:
+            self.freeze()
+        self.layer = layer
+        if self.layer == "last":
+            self.layer_idx = -1
+        else:
+            assert layer_idx is not None
+            self.layer_idx = layer_idx
+
+    def freeze(self):
+        self.model = self.model.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, text):
+        # important: we pass `padding=max_length` since the model was trained with this
+        inputs = self.processor(text=text, images=None, padding="max_length", max_length=self.max_length, return_tensors="pt").to(self.device)
+        outputs = self.model(**inputs, output_hidden_states=True)
+        return outputs[-1][self.layer_idx]
+
+    def encode(self, text):
+        return self(text)
+
+class FrozenBlip2Embedder(AbstractEncoder):
+    """
+    Uses the Blip2 transformer encoder for text
+    """
+    LAYERS = [
+        "last",
+        "hidden"
+    ]
+    def __init__(self, version="Salesforce/blip2-opt-2.7b", device="cuda", max_length=77, freeze=True, layer="last", layer_idx=None):
+        super().__init__()
+        assert layer in self.LAYERS, f"unsupported layer {layer}. Must be one of {self.LAYERS}"
+        self.device = device
+        self.max_length = max_length
+        self.model = Blip2Model.from_pretrained(version).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(version)
+        if freeze:
+            self.freeze()
+        self.layer = layer
+        if self.layer == "last":
+            self.layer_idx = -1
+        else:
+            assert layer_idx is not None
+            self.layer_idx = layer_idx
+
+    def freeze(self):
+        self.model = self.model.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, text):
+        inputs = self.tokenizer(text, truncation=True, max_length=self.max_length,
+                                return_overflowing_tokens=False, padding="max_length", return_tensors="pt").to(device)
+        text_features = self.model.get_text_features(**inputs, output_hidden_states=True)
+        return text_features[-1][self.layer_idx]
+
+    def encode(self, text):
+        return self(text)
 
 class FrozenOpenCLIPEmbedder(AbstractEncoder):
     """
