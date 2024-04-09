@@ -62,9 +62,7 @@ model:
           target: torch.nn.Identity
 
     cond_stage_config:
-      target: ldm.modules.encoders.modules.FrozenOpenCLIPEmbedder
-      #target: ldm.modules.encoders.modules.FrozenCLIPEmbedder
+      target: ldm.modules.encoders.modules.FrozenSiglipEmbedder
       params:
         freeze: True
-        layer: "penultimate"
-        #layer: "last"
+        layer: "last"
