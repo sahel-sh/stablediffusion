@@ -138,6 +138,7 @@ class FrozenCLIPEmbedder(AbstractEncoder):
             z = outputs.pooler_output[:, None, :]
         else:
             z = outputs.hidden_states[self.layer_idx]
+        print(z.shape)
         return z
 
     def encode(self, text):
@@ -258,6 +259,45 @@ class FrozenBlip2Embedder(AbstractEncoder):
     def encode(self, text):
         return self(text)
 
+class FrozenBlip2Embedder(AbstractEncoder):
+    """
+    Uses the Blip2 transformer encoder for text
+    """
+    LAYERS = [
+        "last",
+        "hidden"
+    ]
+    def __init__(self, version="Salesforce/blip2-opt-2.7b", device="cuda", max_length=77, freeze=True, layer="last", layer_idx=None):
+        super().__init__()
+        assert layer in self.LAYERS, f"unsupported layer {layer}. Must be one of {self.LAYERS}"
+        self.device = device
+        self.max_length = max_length
+        self.model = Blip2Model.from_pretrained(version).to(self.device)
+        self.tokenizer = AutoTokenizer.from_pretrained(version)
+        if freeze:
+            self.freeze()
+        self.layer = layer
+        if self.layer == "last":
+            self.layer_idx = -1
+        else:
+            assert layer_idx is not None
+            self.layer_idx = layer_idx
+
+    def freeze(self):
+        self.model = self.model.eval()
+        for param in self.parameters():
+            param.requires_grad = False
+
+    def forward(self, text):
+        inputs = self.tokenizer(text, truncation=True, max_length=self.max_length,
+                                return_overflowing_tokens=False, padding="max_length", return_tensors="pt").to("cuda")
+        text_features = self.model.get_text_features(**inputs, output_hidden_states=True)
+        return text_features[-1][self.layer_idx]
+
+    def encode(self, text):
+        return self(text)
+
+
 class FrozenOpenCLIPEmbedder(AbstractEncoder):
     """
     Uses the OpenCLIP transformer encoder for text
@@ -296,6 +336,7 @@ class FrozenOpenCLIPEmbedder(AbstractEncoder):
     def forward(self, text):
         tokens = open_clip.tokenize(text)
         z = self.encode_with_transformer(tokens.to(self.device))
+        print(z.shape)
         return z
 
     def encode_with_transformer(self, text):

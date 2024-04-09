@@ -200,6 +200,12 @@ def parse_args():
         action='store_true',
         help="Use bfloat16",
     )
+    parser.add_argument(
+        "--skip-watermark",
+        action='store_true',
+        help="Skip adding any invisible watermarks to the generated images",
+        default=False
+    )
     opt = parser.parse_args()
     return opt
 
@@ -229,10 +235,12 @@ def main(opt):
     os.makedirs(opt.outdir, exist_ok=True)
     outpath = opt.outdir
 
-    print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
-    wm = "SDV2"
-    wm_encoder = WatermarkEncoder()
-    wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
+    wm_encoder = None
+    if not opt.skip_watermark:
+        print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
+        wm = "SDV2"
+        wm_encoder = WatermarkEncoder()
+        wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
 
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
