@@ -20,26 +20,91 @@ from ldm.models.diffusion.dpm_solver import DPMSolverSampler
 
 torch.set_grad_enabled(False)
 
+
 def chunk(it, size):
     it = iter(it)
     return iter(lambda: tuple(islice(it, size)), ())
 
 
-def load_model_from_config(config, ckpt, device=torch.device("cuda"), verbose=False):
+def _update_state_dict(
+    src_sd, replace_sd, remove_key="cond_stage_model", add_key="", param_prefix=""
+):
+
+    from copy import deepcopy
+
+    target_sd = deepcopy(src_sd)
+
+    # remove all elements with replace key from the source state dict
+    for name in src_sd.keys():
+        if remove_key in name:
+            del target_sd[name]
+
+    # add keys, param from replace_sd to the target sd
+    for name, param in replace_sd.items():
+        if add_key in name:
+            target_sd[param_prefix + name] = param
+
+    return target_sd
+
+
+def _read_sd_from_safefile(safetensors_file):
+    from safetensors import safe_open
+
+    sd = {}
+    with safe_open(
+        safetensors_file,
+        framework="pt",
+        device="cpu",
+    ) as f:
+        for key in f.keys():
+            sd[key] = f.get_tensor(key)
+
+    return sd
+
+
+def load_model_sd_add_siglip(ckpt, siglip_safetensors):
+    model_sd = torch.load(ckpt, map_location="cpu")["state_dict"]
+    siglip_sd = _read_sd_from_safefile(siglip_safetensors)
+    # Replace conditional encoder with SigLip's text encoder.
+    updated_sd = _update_state_dict(
+        model_sd, siglip_sd, "cond_stage_model", "text_model", "cond_stage_model.model."
+    )
+    return updated_sd
+
+
+def load_model_from_config(
+    config, ckpt, device=torch.device("cuda"), siglip_safetensors=None, verbose=False
+):
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    if "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
-    # print("state dict:\t", sd)
+    if siglip_safetensors:
+        sd = load_model_sd_add_siglip(ckpt, siglip_safetensors)
+    else:
+        pl_sd = torch.load(ckpt, map_location="cpu")
+        if "global_step" in pl_sd:
+            print(f"Global Step: {pl_sd['global_step']}")
+        sd = pl_sd["state_dict"]
     model = instantiate_from_config(config.model)
-    m, u = model.load_state_dict(sd, strict=False)
-    if len(m) > 0 and verbose:
-        print("missing keys:")
-        print(m)
-    if len(u) > 0 and verbose:
-        print("unexpected keys:")
-        print(u)
+
+    # # sanity check for the case that we are loading checkpoint partially, from two identical files
+    # # expectation: the generated output should be the same as loading the whole checkpoint file at once
+    # updated_sd = _update_state_dict(sd, sd, "cond_stage_model", "cond_stage_model", "")
+
+    # # read siglip parameters
+    # siglip_sd = _read_sd_from_safefile()
+
+    # from os.path import exists
+
+    # updated_sd_path = "./scripts/updated_sd.pt"
+    # if exists(updated_sd_path):
+    #     updated_sd = torch.load(updated_sd_path)
+    # else:
+    #     # should add the text encoder parameters from the siglip state dict
+    #     updated_sd = _update_state_dict(
+    #         sd, siglip_sd, "cond_stage_model", "text_model", "cond_stage_model.model."
+    #     )
+    #     torch.save(updated_sd, updated_sd_path)
+
+    model.load_state_dict(sd, strict=False)
 
     if device == torch.device("cuda"):
         model.cuda()
@@ -59,14 +124,14 @@ def parse_args():
         type=str,
         nargs="?",
         default="a professional photograph of an astronaut riding a triceratops",
-        help="the prompt to render"
+        help="the prompt to render",
     )
     parser.add_argument(
         "--outdir",
         type=str,
         nargs="?",
         help="dir to write results to",
-        default="outputs/txt2img-samples"
+        default="outputs/txt2img-samples",
     )
     parser.add_argument(
         "--steps",
@@ -76,17 +141,17 @@ def parse_args():
     )
     parser.add_argument(
         "--plms",
-        action='store_true',
+        action="store_true",
         help="use plms sampling",
     )
     parser.add_argument(
         "--dpm",
-        action='store_true',
+        action="store_true",
         help="use DPM (2) sampler",
     )
     parser.add_argument(
         "--fixed_code",
-        action='store_true',
+        action="store_true",
         help="if enabled, uses the same starting code across all samples ",
     )
     parser.add_argument(
@@ -170,7 +235,7 @@ def parse_args():
         type=str,
         help="evaluate at this precision",
         choices=["full", "autocast"],
-        default="autocast"
+        default="autocast",
     )
     parser.add_argument(
         "--repeat",
@@ -183,28 +248,34 @@ def parse_args():
         type=str,
         help="Device on which Stable Diffusion will be run",
         choices=["cpu", "cuda"],
-        default="cpu"
+        default="cpu",
     )
     parser.add_argument(
         "--torchscript",
-        action='store_true',
+        action="store_true",
         help="Use TorchScript",
     )
     parser.add_argument(
         "--ipex",
-        action='store_true',
+        action="store_true",
         help="Use Intel® Extension for PyTorch*",
     )
     parser.add_argument(
         "--bf16",
-        action='store_true',
+        action="store_true",
         help="Use bfloat16",
     )
     parser.add_argument(
         "--skip-watermark",
-        action='store_true',
+        action="store_true",
         help="Skip adding any invisible watermarks to the generated images",
-        default=False
+        default=False,
+    )
+    parser.add_argument(
+        "--siglip_safetensors",
+        type=str,
+        help="When siglip is used as the text encoder, its state dict will be read from this safetensors file",
+        default=None,
     )
     opt = parser.parse_args()
     return opt
@@ -213,7 +284,7 @@ def parse_args():
 def put_watermark(img, wm_encoder=None):
     if wm_encoder is not None:
         img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
-        img = wm_encoder.encode(img, 'dwtDct')
+        img = wm_encoder.encode(img, "dwtDct")
         img = Image.fromarray(img[:, :, ::-1])
     return img
 
@@ -223,7 +294,9 @@ def main(opt):
 
     config = OmegaConf.load(f"{opt.config}")
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
-    model = load_model_from_config(config, f"{opt.ckpt}", device)
+    model = load_model_from_config(
+        config, f"{opt.ckpt}", device, opt.siglip_safetensors
+    )
 
     if opt.plms:
         sampler = PLMSSampler(model, device=device)
@@ -237,10 +310,12 @@ def main(opt):
 
     wm_encoder = None
     if not opt.skip_watermark:
-        print("Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)...")
+        print(
+            "Creating invisible watermark encoder (see https://github.com/ShieldMnt/invisible-watermark)..."
+        )
         wm = "SDV2"
         wm_encoder = WatermarkEncoder()
-        wm_encoder.set_watermark('bytes', wm.encode('utf-8'))
+        wm_encoder.set_watermark("bytes", wm.encode("utf-8"))
 
     batch_size = opt.n_samples
     n_rows = opt.n_rows if opt.n_rows > 0 else batch_size
@@ -264,7 +339,9 @@ def main(opt):
 
     start_code = None
     if opt.fixed_code:
-        start_code = torch.randn([opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device)
+        start_code = torch.randn(
+            [opt.n_samples, opt.C, opt.H // opt.f, opt.W // opt.f], device=device
+        )
 
     if opt.torchscript or opt.ipex:
         transformer = model.cond_stage_model.model
@@ -274,31 +351,50 @@ def main(opt):
         shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
 
         if opt.bf16 and not opt.torchscript and not opt.ipex:
-            raise ValueError('Bfloat16 is supported only for torchscript+ipex')
+            raise ValueError("Bfloat16 is supported only for torchscript+ipex")
         if opt.bf16 and unet.dtype != torch.bfloat16:
-            raise ValueError("Use configs/stable-diffusion/intel/ configs with bf16 enabled if " +
-                             "you'd like to use bfloat16 with CPU.")
+            raise ValueError(
+                "Use configs/stable-diffusion/intel/ configs with bf16 enabled if "
+                + "you'd like to use bfloat16 with CPU."
+            )
         if unet.dtype == torch.float16 and device == torch.device("cpu"):
-            raise ValueError("Use configs/stable-diffusion/intel/ configs for your model if you'd like to run it on CPU.")
+            raise ValueError(
+                "Use configs/stable-diffusion/intel/ configs for your model if you'd like to run it on CPU."
+            )
 
         if opt.ipex:
             import intel_extension_for_pytorch as ipex
+
             bf16_dtype = torch.bfloat16 if opt.bf16 else None
             transformer = transformer.to(memory_format=torch.channels_last)
             transformer = ipex.optimize(transformer, level="O1", inplace=True)
 
             unet = unet.to(memory_format=torch.channels_last)
-            unet = ipex.optimize(unet, level="O1", auto_kernel_selection=True, inplace=True, dtype=bf16_dtype)
+            unet = ipex.optimize(
+                unet,
+                level="O1",
+                auto_kernel_selection=True,
+                inplace=True,
+                dtype=bf16_dtype,
+            )
 
             decoder = decoder.to(memory_format=torch.channels_last)
-            decoder = ipex.optimize(decoder, level="O1", auto_kernel_selection=True, inplace=True, dtype=bf16_dtype)
+            decoder = ipex.optimize(
+                decoder,
+                level="O1",
+                auto_kernel_selection=True,
+                inplace=True,
+                dtype=bf16_dtype,
+            )
 
         if opt.torchscript:
             with torch.no_grad(), additional_context:
                 # get UNET scripted
                 if unet.use_checkpoint:
-                    raise ValueError("Gradient checkpoint won't work with tracing. " +
-                    "Use configs/stable-diffusion/intel/ configs for your model or disable checkpoint in your config.")
+                    raise ValueError(
+                        "Gradient checkpoint won't work with tracing. "
+                        + "Use configs/stable-diffusion/intel/ configs for your model or disable checkpoint in your config."
+                    )
 
                 img_in = torch.ones(2, 4, 96, 96, dtype=torch.float32)
                 t_in = torch.ones(2, dtype=torch.int64)
@@ -326,70 +422,77 @@ def main(opt):
         with torch.no_grad(), additional_context:
             for _ in range(3):
                 c = model.get_learned_conditioning(prompts)
-            samples_ddim, _ = sampler.sample(S=5,
-                                             conditioning=c,
-                                             batch_size=batch_size,
-                                             shape=shape,
-                                             verbose=False,
-                                             unconditional_guidance_scale=opt.scale,
-                                             unconditional_conditioning=uc,
-                                             eta=opt.ddim_eta,
-                                             x_T=start_code)
+            samples_ddim, _ = sampler.sample(
+                S=5,
+                conditioning=c,
+                batch_size=batch_size,
+                shape=shape,
+                verbose=False,
+                unconditional_guidance_scale=opt.scale,
+                unconditional_conditioning=uc,
+                eta=opt.ddim_eta,
+                x_T=start_code,
+            )
             print("Running a forward pass for decoder")
             for _ in range(3):
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
 
-    precision_scope = autocast if opt.precision=="autocast" or opt.bf16 else nullcontext
-    with torch.no_grad(), \
-        precision_scope(opt.device), \
-        model.ema_scope():
-            all_samples = list()
-            for n in trange(opt.n_iter, desc="Sampling"):
-                for prompts in tqdm(data, desc="data"):
-                    uc = None
-                    if opt.scale != 1.0:
-                        uc = model.get_learned_conditioning(batch_size * [""])
-                    if isinstance(prompts, tuple):
-                        prompts = list(prompts)
-                    c = model.get_learned_conditioning(prompts)
-                    shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
-                    samples, _ = sampler.sample(S=opt.steps,
-                                                     conditioning=c,
-                                                     batch_size=opt.n_samples,
-                                                     shape=shape,
-                                                     verbose=False,
-                                                     unconditional_guidance_scale=opt.scale,
-                                                     unconditional_conditioning=uc,
-                                                     eta=opt.ddim_eta,
-                                                     x_T=start_code)
+    precision_scope = (
+        autocast if opt.precision == "autocast" or opt.bf16 else nullcontext
+    )
+    with torch.no_grad(), precision_scope(opt.device), model.ema_scope():
+        all_samples = list()
+        for n in trange(opt.n_iter, desc="Sampling"):
+            for prompts in tqdm(data, desc="data"):
+                uc = None
+                if opt.scale != 1.0:
+                    uc = model.get_learned_conditioning(batch_size * [""])
+                if isinstance(prompts, tuple):
+                    prompts = list(prompts)
+                c = model.get_learned_conditioning(prompts)
+                shape = [opt.C, opt.H // opt.f, opt.W // opt.f]
+                samples, _ = sampler.sample(
+                    S=opt.steps,
+                    conditioning=c,
+                    batch_size=opt.n_samples,
+                    shape=shape,
+                    verbose=False,
+                    unconditional_guidance_scale=opt.scale,
+                    unconditional_conditioning=uc,
+                    eta=opt.ddim_eta,
+                    x_T=start_code,
+                )
 
-                    x_samples = model.decode_first_stage(samples)
-                    x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
+                x_samples = model.decode_first_stage(samples)
+                x_samples = torch.clamp((x_samples + 1.0) / 2.0, min=0.0, max=1.0)
 
-                    for x_sample in x_samples:
-                        x_sample = 255. * rearrange(x_sample.cpu().numpy(), 'c h w -> h w c')
-                        img = Image.fromarray(x_sample.astype(np.uint8))
-                        img = put_watermark(img, wm_encoder)
-                        img.save(os.path.join(sample_path, f"{base_count:05}.png"))
-                        base_count += 1
-                        sample_count += 1
+                for x_sample in x_samples:
+                    x_sample = 255.0 * rearrange(
+                        x_sample.cpu().numpy(), "c h w -> h w c"
+                    )
+                    img = Image.fromarray(x_sample.astype(np.uint8))
+                    img = put_watermark(img, wm_encoder)
+                    img.save(os.path.join(sample_path, f"{base_count:05}.png"))
+                    base_count += 1
+                    sample_count += 1
 
-                    all_samples.append(x_samples)
+                all_samples.append(x_samples)
 
-            # additionally, save as grid
-            grid = torch.stack(all_samples, 0)
-            grid = rearrange(grid, 'n b c h w -> (n b) c h w')
-            grid = make_grid(grid, nrow=n_rows)
+        # additionally, save as grid
+        grid = torch.stack(all_samples, 0)
+        grid = rearrange(grid, "n b c h w -> (n b) c h w")
+        grid = make_grid(grid, nrow=n_rows)
 
-            # to image
-            grid = 255. * rearrange(grid, 'c h w -> h w c').cpu().numpy()
-            grid = Image.fromarray(grid.astype(np.uint8))
-            grid = put_watermark(grid, wm_encoder)
-            grid.save(os.path.join(outpath, f'grid-{grid_count:04}.png'))
-            grid_count += 1
+        # to image
+        grid = 255.0 * rearrange(grid, "c h w -> h w c").cpu().numpy()
+        grid = Image.fromarray(grid.astype(np.uint8))
+        grid = put_watermark(grid, wm_encoder)
+        grid.save(os.path.join(outpath, f"grid-{grid_count:04}.png"))
+        grid_count += 1
 
-    print(f"Your samples are ready and waiting for you here: \n{outpath} \n"
-          f" \nEnjoy.")
+    print(
+        f"Your samples are ready and waiting for you here: \n{outpath} \n" f" \nEnjoy."
+    )
 
 
 if __name__ == "__main__":
