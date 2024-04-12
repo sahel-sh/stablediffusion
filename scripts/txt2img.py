@@ -47,12 +47,12 @@ def _update_state_dict(
     return target_sd
 
 
-def _read_from_safefile():
+def _read_sd_from_safefile(safetensors_file):
     from safetensors import safe_open
 
     sd = {}
     with safe_open(
-        "/home/coder/stablediffusion/scripts/model.safetensors",
+        safetensors_file,
         framework="pt",
         device="cpu",
     ) as f:
@@ -62,34 +62,49 @@ def _read_from_safefile():
     return sd
 
 
-def load_model_from_config(config, ckpt, device=torch.device("cuda"), verbose=False):
+def load_model_sd_add_siglip(ckpt, siglip_safetensors):
+    model_sd = torch.load(ckpt, map_location="cpu")["state_dict"]
+    siglip_sd = _read_sd_from_safefile(siglip_safetensors)
+    # Replace conditional encoder with SigLip's text encoder.
+    updated_sd = _update_state_dict(
+        model_sd, siglip_sd, "cond_stage_model", "text_model", "cond_stage_model.model."
+    )
+    return updated_sd
+
+
+def load_model_from_config(
+    config, ckpt, device=torch.device("cuda"), siglip_safetensors=None, verbose=False
+):
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    if "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
+    if siglip_safetensors:
+        sd = load_model_sd_add_siglip(ckpt, siglip_safetensors)
+    else:
+        pl_sd = torch.load(ckpt, map_location="cpu")
+        if "global_step" in pl_sd:
+            print(f"Global Step: {pl_sd['global_step']}")
+        sd = pl_sd["state_dict"]
     model = instantiate_from_config(config.model)
 
     # # sanity check for the case that we are loading checkpoint partially, from two identical files
     # # expectation: the generated output should be the same as loading the whole checkpoint file at once
     # updated_sd = _update_state_dict(sd, sd, "cond_stage_model", "cond_stage_model", "")
 
-    # read siglip parameters
-    siglip_sd = _read_from_safefile()
+    # # read siglip parameters
+    # siglip_sd = _read_sd_from_safefile()
 
-    from os.path import exists
+    # from os.path import exists
 
-    updated_sd_path = "./scripts/updated_sd.pt"
-    if exists(updated_sd_path):
-        updated_sd = torch.load(updated_sd_path)
-    else:
-        # should add the text encoder parameters from the siglip state dict
-        updated_sd = _update_state_dict(
-            sd, siglip_sd, "cond_stage_model", "text_model", "cond_stage_model.model."
-        )
-        torch.save(updated_sd, updated_sd_path)
+    # updated_sd_path = "./scripts/updated_sd.pt"
+    # if exists(updated_sd_path):
+    #     updated_sd = torch.load(updated_sd_path)
+    # else:
+    #     # should add the text encoder parameters from the siglip state dict
+    #     updated_sd = _update_state_dict(
+    #         sd, siglip_sd, "cond_stage_model", "text_model", "cond_stage_model.model."
+    #     )
+    #     torch.save(updated_sd, updated_sd_path)
 
-    model.load_state_dict(updated_sd, strict=False)
+    model.load_state_dict(sd, strict=False)
 
     if device == torch.device("cuda"):
         model.cuda()
@@ -256,6 +271,12 @@ def parse_args():
         help="Skip adding any invisible watermarks to the generated images",
         default=False,
     )
+    parser.add_argument(
+        "--siglip_safetensors",
+        type=str,
+        help="When siglip is used as the text encoder, its state dict will be read from this safetensors file",
+        default=None,
+    )
     opt = parser.parse_args()
     return opt
 
@@ -273,7 +294,9 @@ def main(opt):
 
     config = OmegaConf.load(f"{opt.config}")
     device = torch.device("cuda") if opt.device == "cuda" else torch.device("cpu")
-    model = load_model_from_config(config, f"{opt.ckpt}", device)
+    model = load_model_from_config(
+        config, f"{opt.ckpt}", device, opt.siglip_safetensors
+    )
 
     if opt.plms:
         sampler = PLMSSampler(model, device=device)
