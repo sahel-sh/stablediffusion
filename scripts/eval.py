@@ -3,12 +3,13 @@ import cv2
 import numpy as np
 import os
 from typing import List
-import gc
+import json
 
 from tqdm import tqdm
 import torch
-from torchmetrics.multimodal.clip_score import CLIPScore
 from torchmetrics.image.fid import FrechetInceptionDistance
+from torchmetrics.image.inception import InceptionScore
+from torchmetrics.multimodal.clip_score import CLIPScore
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -28,7 +29,7 @@ def parse_args():
         "--batch-count",
         type=int,
         default=4,
-        help="comma separated image dirs, each dir contains a subset of generated images"
+        help="The number of batches of prompts and images"
     )
     parser.add_argument(
         "--clip-model",
@@ -42,6 +43,18 @@ def parse_args():
         required=True,
         help="The directory where the ground truth images are stored"
     )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=50,
+        help="The batch size for calculating metrics in batches",
+    )
+    parser.add_argument(
+        "--output-file",
+        type=str,
+        required=True,
+        help="Where to store the json metrics file",
+    )
     return parser.parse_args()
 
 def load_prompts(prompt_dir:str, batch_index:int):
@@ -54,6 +67,7 @@ def load_prompts(prompt_dir:str, batch_index:int):
 def load_images(dir:str):
     images = []
     img_files = os.listdir(dir)
+    img_files = sorted(img_files)
     for img_name in tqdm(img_files):
         img_path = os.path.join(dir, img_name)
         img = cv2.imread(img_path)
@@ -62,64 +76,83 @@ def load_images(dir:str):
         del img
     return images
 
-def calculate_clip_score(images, prompts, model_name):
+
+def calculate_clip_score(images, prompts, batch_size, model_name, device):
     assert len(images) == len(prompts), "The number of images and prompts must be equal"
     metric = CLIPScore(model_name_or_path=model_name)
-    clip_score = metric(images, prompts)
-    return round(float(clip_score), 4)
+    for i in tqdm(range(0, len(images), batch_size)):
+        image_chunk = torch.from_numpy(
+            np.asarray(images[i : i + batch_size]).astype("uint8")
+        )
+        prompt_chunk = prompts[i : i + batch_size]
+        metric.update(image_chunk.permute(0, 3, 1, 2).to(device), prompt_chunk)
+    return metric.compute()
 
-def create_fid(real_imgs, gen_imgs):
+
+def calculate_fid(real_images, gen_images, batch_size, device):
+    assert len(real_images) == len(
+        gen_images
+    ), "The number of ground truth and generated images must be equal"
     metric = FrechetInceptionDistance()
-    assert len(real_imgs) == len(gen_imgs), "The number of generated and ground truth images must be equal"
-    metric.update(real_imgs, real=True)
-    metric.update(gen_imgs, real=False)
-    return metric
+    for i in tqdm(range(0, len(real_images), batch_size)):
+        real = np.asarray(real_images[i : i + batch_size]).astype("uint8")
+        real = torch.from_numpy(real)
+        real = real.permute(0, 3, 1, 2).to(device)
+        metric.update(real, real=True)
+        gen = np.asarray(gen_images[i : i + batch_size]).astype("uint8")
+        gen = torch.from_numpy(gen)
+        gen = gen.permute(0, 3, 1, 2).to(device)
+        metric.update(gen, real=False)
+    return metric.compute()
+
+
+def calculate_inception_score(images, batch_size, device):
+    images = [cv2.resize(img, (299, 299)) for img in images]
+    metric = InceptionScore()
+    for i in tqdm(range(0, len(images), batch_size)):
+        image_chunk = torch.from_numpy(
+            np.asarray(images[i : i + batch_size]).astype("uint8")
+        )
+        metric.update(image_chunk.permute(0, 3, 1, 2).to(device))
+    return metric.compute()
+
 
 def main(args):
-    # total_score = 0
-    # total_count = 0
-    # for i in range(args.batch_count):
-    #     prompts = load_prompts(args.prompt_dir, i)
-    #     dir = os.path.join(args.generated_img_root_dir, f"prompts_{i}/samples")
-    #     images = load_images(dir)
-    #     batch_size = len(prompts)
-    #     total_count += batch_size
-    #     total_score += batch_size * calculate_clip_score(images, prompts, args.clip_model)
-    #     del prompts
-    #     del images
-    #     gc.collect()
-    # print(f"CLIP score: {total_score/total_count}")
-
+    device = "cpu"
+    torch.set_default_device(device)
+    print("Loading prompts")
+    prompts = []
+    for i in range(args.batch_count):
+        prompts.extend(load_prompts(args.prompt_dir, i))
+    print("Loading generated images")
     gen_images = []
     for i in range(args.batch_count):
         dir = os.path.join(args.generated_img_root_dir, f"prompts_{i}/samples")
         gen_images.extend(load_images(dir))
+ 
+    print("Loading ground truth images")
     real_images = load_images(args.ground_truth_img_dir)
-    sh = real_images[0].shape
-    print(sh)
-    for real_image in real_images:
-        if real_image.shape != sh:
-            print(real_image.shape)
-    print("loaded all images")
+    assert len(real_images) == len(gen_images) == len(prompts)
 
-    metric = FrechetInceptionDistance()
-    batch_size = 100
-    for i in tqdm(range(0, len(real_images), batch_size)):
-        real = np.asarray(real_images[i:i+batch_size])
-        print(real.shape)
-        real = torch.from_numpy(real)
-        real = real.permute(0, 3, 1, 2)
-        print(real.shape)
-        metric.update(real, real=True)
-        gen = np.asarray(gen_images[i:i+batch_size])
-        print(gen.shape)
-        gen = torch.from_numpy(gen)
-        gen = gen.permute(0, 3, 1, 2)
-        print(gen.shape)
-        metric.update(gen, real=False)
-    print(f"FID score: {metric.compute()}")
+    print("Calculating FID:")
+    fid = calculate_fid(real_images, gen_images, args.batch_size, device)
+    print("Calculating CLIPScore:")
+    clip_score = calculate_clip_score(
+        gen_images, prompts, args.batch_size, args.clip_model, device
+    )
+    # calculate inception score last since it resizes the generated images to 299x299
+    print("Calculating IS:")
+    IS = calculate_inception_score(gen_images, args.batch_size, device)
+    metrics = {
+        "FID": round(fid.detach().cpu().numpy().tolist(), 2),
+        "CLIPScore": round(clip_score.detach().cpu().numpy().tolist(), 2),
+        "IS": round(IS[0].detach().cpu().numpy().tolist(), 2),
+        "IS_Standard_Deviation": round(IS[1].detach().cpu().numpy().tolist(), 2),
+    }
+    print(metrics.__repr__())
+    with open(args.output_file, "w") as f:
+        json.dump(metrics, f)
 
-    
 
 if __name__ == "__main__":
     args = parse_args()
